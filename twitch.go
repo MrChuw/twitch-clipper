@@ -41,7 +41,7 @@ func FetchTwitchStream(channelName string, retries int) ([]string, error) {
 
 	if time.Now().After(d.Expiry) {
 		res, err := httpClient.Get(
-			fmt.Sprintf("https://luminous.alienpls.org/live/%s?platform=web&allow_source=true&allow_audio_only=false", url.PathEscape(channelName)),
+			fmt.Sprintf("https://luminous.alienpls.org/live/%s?platform=web&allow_source=true&allow_audio_only=true", url.PathEscape(channelName)),
 		)
 		if err != nil {
 			return nil, err
@@ -248,6 +248,7 @@ func MakePreview(channelName string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read preview file: %w", err)
 	}
+
 	if err := os.Remove(previewPath); err != nil {
 		return data, fmt.Errorf("preview generated but failed to remove file: %w", err)
 	}
