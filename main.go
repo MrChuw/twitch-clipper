@@ -9,6 +9,7 @@ import (
 	"time"
 	"sync"
 	"net"
+	"os"
 )
 
 var httpAddr = "0.0.0.0:8989"
@@ -23,9 +24,12 @@ func resError(w http.ResponseWriter, message string, statusCode int) {
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(m)
 }
+
+
 var (
 	visitors   = make(map[string][]time.Time)
 	visitorsMu sync.Mutex
+	bypassList []string
 )
 
 const (
@@ -34,42 +38,69 @@ const (
 	cleanupInt = 1 * time.Minute
 )
 
+func loadBypassList() {
+	raw := os.Getenv("BYPASS_IPS")
+	if raw == "" {
+		return
+	}
+	for _, ip := range strings.Split(raw, ",") {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			bypassList = append(bypassList, ip)
+		}
+	}
+}
+
+func isBypassed(ip string) bool {
+	for _, b := range bypassList {
+		if ip == b {
+			return true
+		}
+	}
+	return false
+}
+
 func clientKey(r *http.Request) string {
 	ip := r.Header.Get("X-Forwarded-For")
 	if ip != "" {
 		parts := strings.Split(ip, ",")
-		return strings.TrimSpace(parts[0])
+		ip = strings.TrimSpace(parts[0])
+	} else if val := r.Header.Get("X-Real-IP"); val != "" {
+		ip = strings.TrimSpace(val)
+	} else {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		} else {
+			ip = host
+		}
 	}
-	ip = r.Header.Get("X-Real-IP")
-	if ip != "" {
-		return strings.TrimSpace(ip)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return ip
 }
 
-func allowRequest(key string) bool {
+func allowRequest(ip string) bool {
+	if isBypassed(ip) {
+		return true
+	}
+
 	now := time.Now()
 	cutoff := now.Add(-reqWindow)
 
 	visitorsMu.Lock()
 	defer visitorsMu.Unlock()
 
-	ts := visitors[key]
+	ts := visitors[ip]
 	keep := 0
 	for keep < len(ts) && ts[keep].Before(cutoff) {
 		keep++
 	}
 	ts = ts[keep:]
 	if len(ts) >= reqLimit {
-		visitors[key] = ts
+		visitors[ip] = ts
 		return false
 	}
 	ts = append(ts, now)
-	visitors[key] = ts
+	visitors[ip] = ts
 	return true
 }
 
