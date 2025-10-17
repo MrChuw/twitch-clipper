@@ -1,0 +1,7 @@
+services:
+  twitch-clipper:
+    container_name: twitch-clipper
+    build: .
+    ports:
+      - "38989:8989"
+    restart: unless-stopped

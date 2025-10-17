@@ -41,7 +41,7 @@ func FetchTwitchStream(channelName string, retries int) ([]string, error) {
 
 	if time.Now().After(d.Expiry) {
 		res, err := httpClient.Get(
-			fmt.Sprintf("https://luminous.alienpls.org/live/%s?platform=web&allow_source=true&allow_audio_only=true", url.PathEscape(channelName)),
+			fmt.Sprintf("https://luminous.alienpls.org/live/%s?platform=web&allow_source=true&allow_audio_only=false", url.PathEscape(channelName)),
 		)
 		if err != nil {
 			return nil, err
@@ -100,10 +100,10 @@ func FetchTwitchStream(channelName string, retries int) ([]string, error) {
 	return segments, nil
 }
 
-func MakeClip(channelName string) (string, error) {
+func MakeClip(channelName string) ([]byte, error) {
 	segments, err := FetchTwitchStream(channelName, 1)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	segmentCount := len(segments)
@@ -148,7 +148,7 @@ func MakeClip(channelName string) (string, error) {
 	for err := range ch {
 		if err != nil {
 			futile = true
-			return "", err
+			return nil, err
 		}
 	}
 
@@ -162,7 +162,7 @@ func MakeClip(channelName string) (string, error) {
 		"-f", format, clipPath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	go func() {
@@ -174,17 +174,26 @@ func MakeClip(channelName string) (string, error) {
 
 	err = cmd.Run()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return fmt.Sprintf("%s/%v.%s", channelName, clipID, format), err
+	data, err := os.ReadFile(clipPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.Remove(clipPath); err != nil {
+		return data, fmt.Errorf("failed to remove file: %w", err)
+	}
+
+	return data, nil
 }
 
-func MakePreview(channelName string) (string, error) {
+func MakePreview(channelName string) ([]byte, error) {
 	// First fetch stream segments
 	segments, err := FetchTwitchStream(channelName, 1)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Take only the last segment
@@ -202,14 +211,14 @@ func MakePreview(channelName string) (string, error) {
 	// Download the segment
 	res, err := httpClient.Get(lastSegment)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer res.Body.Close()
 
 	// Save segment to temporary file
 	tempFile, err := os.Create(tempVideoPath)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer func() {
 		tempFile.Close()
@@ -218,7 +227,7 @@ func MakePreview(channelName string) (string, error) {
 
 	_, err = io.Copy(tempFile, res.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Extract last frame using ffmpeg
@@ -232,9 +241,15 @@ func MakePreview(channelName string) (string, error) {
 
 	err = cmd.Run()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// return previewPath, nil
-	return fmt.Sprintf("%s/%v.jpg", channelName, previewID), nil
+	data, err := os.ReadFile(previewPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read preview file: %w", err)
+	}
+	if err := os.Remove(previewPath); err != nil {
+		return data, fmt.Errorf("preview generated but failed to remove file: %w", err)
+	}
+	return data, nil
 }
