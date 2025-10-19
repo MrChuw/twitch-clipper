@@ -6,14 +6,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
-	"path"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
+	"bytes"
+	"sync"
+
 )
+
 
 var clipsPath = "./clips"
 var previewsPath = "./previews"
@@ -32,11 +33,7 @@ var m3SegmentExp = regexp.MustCompile("#EXTINF:.*live\n.+")
 
 var httpClient = &http.Client{Timeout: time.Minute}
 
-func FetchTwitchStream(channelName string, retries int) ([]string, error) {
-	if retries > 3 {
-		return nil, fmt.Errorf("failed fetching stream segments after %v tries", retries)
-	}
-
+func FetchTwitchStream(channelName string) (string, error) {
 	d := playlistCache[channelName]
 
 	if time.Now().After(d.Expiry) {
@@ -44,213 +41,201 @@ func FetchTwitchStream(channelName string, retries int) ([]string, error) {
 			fmt.Sprintf("https://luminous.alienpls.org/live/%s?platform=web&allow_source=true&allow_audio_only=true", url.PathEscape(channelName)),
 		)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 
 		defer res.Body.Close()
 		buf, err := io.ReadAll(res.Body)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 
 		d.Body = string(buf)
 		if res.StatusCode == http.StatusNotFound {
-			return nil, ErrStreamNotFound
+			return "", ErrStreamNotFound
 		} else if res.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("proxy -> bad status code (%v):\n%s", res.StatusCode, d.Body)
+			return "", fmt.Errorf("proxy -> bad status code (%v):\n%s", res.StatusCode, d.Body)
 		}
 	}
 
 	streams := urlExp.FindAllString(d.Body, 1)
 	if len(streams) == 0 {
-		return nil, errors.New("no stream playlist available")
+		return "", errors.New("no stream playlist available")
 	}
 
-	res, err := httpClient.Get(streams[0])
-	if err != nil {
-		return nil, err
-	}
+	return string(streams[0]), nil
 
-	if res.StatusCode != http.StatusOK {
-		d.Expiry = time.Now()
-		playlistCache[channelName] = d
-		return FetchTwitchStream(channelName, retries+1)
-	}
-
-	defer res.Body.Close()
-	buf, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	filter := m3SegmentExp.FindAllString(string(buf), -1)
-	if len(filter) == 0 {
-		return FetchTwitchStream(channelName, retries+1)
-	}
-
-	segments := []string{}
-	for _, s := range filter {
-		segments = append(segments, s[strings.Index(s, "\n")+1:])
-	}
-
-	d.Expiry = time.Now().Add(time.Hour)
-
-	playlistCache[channelName] = d
-
-	return segments, nil
 }
 
 func MakeClip(channelName string) ([]byte, error) {
-	segments, err := FetchTwitchStream(channelName, 1)
-	if err != nil {
-		return nil, err
-	}
+    // 1. Fetch HLS segments
+    url, err := FetchTwitchStream(channelName)
+    if err != nil {
+        return nil, err
+    }
 
-	segmentCount := len(segments)
+    res, err := httpClient.Get(url)
+    if err != nil {
+        return nil, err
+    }
 
-	format := "mp4"
-	clipID := time.Now().Unix()
-	clipPath := fmt.Sprintf("%s/%s/%v.%s", clipsPath, channelName, clipID, format)
+    defer res.Body.Close()
+    buf, err := io.ReadAll(res.Body)
+    if err != nil {
+        return nil, err
+    }
 
-	buffer := make([][]byte, segmentCount)
-	var wg sync.WaitGroup
-	wg.Add(segmentCount)
+    filter := m3SegmentExp.FindAllString(string(buf), -1)
+    segments := []string{}
+    for _, s := range filter {
+        segments = append(segments, s[strings.Index(s, "\n")+1:])
+    }
 
-	var futile bool
-	ch := make(chan error, segmentCount)
-	for i, url := range segments {
-		go func(i int, url string) {
-			defer wg.Done()
+    segmentCount := len(segments)
+    buffer := make([][]byte, segmentCount)
+    var wg sync.WaitGroup
+    var futile bool
+    ch := make(chan error, segmentCount)
 
-			res, err := httpClient.Get(url)
-			if err != nil && !futile {
-				ch <- err
-				return
-			}
+    // 2. Download segments in parallel
+    for i, url := range segments {
+        wg.Add(1)
+        go func(i int, url string) {
+            defer wg.Done()
+            res, err := httpClient.Get(url)
+            if err != nil && !futile {
+                ch <- err
+                return
+            }
+            defer res.Body.Close()
+            buf, err := io.ReadAll(res.Body)
+            if !futile {
+                if err != nil {
+                    ch <- err
+                    return
+                }
+                buffer[i] = buf
+            }
+        }(i, url)
+    }
 
-			defer res.Body.Close()
-			buf, err := io.ReadAll(res.Body)
-			if !futile {
-				if err != nil {
-					ch <- err
-					return
-				}
-				buffer[i] = buf
-			}
-		}(i, url)
-	}
+    go func() {
+        wg.Wait()
+        close(ch)
+    }()
 
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
+    for err := range ch {
+        if err != nil {
+            futile = true
+            return nil, err
+        }
+    }
 
-	for err := range ch {
-		if err != nil {
-			futile = true
-			return nil, err
-		}
-	}
+    // 3. Pipe between ffmpeg for concatenation and ffmpeg for MP4
+    tsToMP4Reader, tsToMP4Writer := io.Pipe()
 
-	os.MkdirAll(path.Dir(clipPath), os.ModePerm)
+    // ffmpeg concatenates .ts into a single MPEG-TS stream
+    concatCmd := exec.Command("ffmpeg",
+        "-hide_banner",
+        "-f", "mpegts",
+        "-loglevel", "error",
+        "-i", "-",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-c:s", "copy",
+        "-f", "mpegts",
+        "pipe:1",
+    )
+    concatCmd.Stdin = io.NopCloser(bytes.NewReader(bytes.Join(buffer, nil)))
+    concatCmd.Stdout = tsToMP4Writer
+    concatCmd.Stderr = nil
 
-	cmd := exec.Command("ffmpeg",
-		"-hide_banner",
-		"-f", "mpegts",
-		"-i", "-",
-		"-c:v", "copy", "-c:a", "copy", "-c:s", "copy",
-		"-f", format, clipPath)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
+    // ffmpeg converts MPEG-TS to the final MP4
+    var out bytes.Buffer
+    var stderr bytes.Buffer
+    mp4Cmd := exec.Command("ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", "pipe:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-c:s", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov",
+        "pipe:1",
+    )
+    mp4Cmd.Stdin = tsToMP4Reader
+    mp4Cmd.Stdout = &out
+    mp4Cmd.Stderr = nil
 
-	go func() {
-		for _, d := range buffer {
-			stdin.Write(d)
-		}
-		stdin.Close()
-	}()
+    // 4. Run both ffmpeg processes in parallel
+    if err := concatCmd.Start(); err != nil {
+        return nil, err
+    }
+    if err := mp4Cmd.Start(); err != nil {
+        return nil, err
+    }
 
-	err = cmd.Run()
-	if err != nil {
-		return nil, err
-	}
+    // Wait for them to finish
+    concatErr := concatCmd.Wait()
+    tsToMP4Writer.Close() // close the pipe
+    mp4Err := mp4Cmd.Wait()
 
-	data, err := os.ReadFile(clipPath)
-	if err != nil {
-		return nil, err
-	}
+    if concatErr != nil {
+        return nil, fmt.Errorf("concat ffmpeg failed: %v", concatErr)
+    }
+    if mp4Err != nil {
+        lines := strings.Split(stderr.String(), "\n")
+        var filtered []string
+        for _, line := range lines {
+            line = strings.TrimSpace(line)
+            if strings.HasPrefix(line, "Error") || strings.Contains(line, "does not contain any stream") {
+                filtered = append(filtered, line)
+            }
+        }
+        filteredMsg := strings.Join(filtered, "\n")
+        return nil, fmt.Errorf("ffmpeg failed: %v\n%s", mp4Err, filteredMsg)
+    }
 
-	if err := os.Remove(clipPath); err != nil {
-		return data, fmt.Errorf("failed to remove file: %w", err)
-	}
-
-	return data, nil
+    return out.Bytes(), nil
 }
 
 func MakePreview(channelName string) ([]byte, error) {
-	// First fetch stream segments
-	segments, err := FetchTwitchStream(channelName, 1)
-	if err != nil {
-		return nil, err
-	}
+    // First fetch stream segments
+    url, err := FetchTwitchStream(channelName)
+    if err != nil {
+        return nil, err
+    }
 
-	// Take only the last segment
-	lastSegment := segments[len(segments)-1]
+    // Extract last frame using ffmpeg
+    var out bytes.Buffer
+    var stderr bytes.Buffer
 
-	// Create temporary paths
-	tempDir := fmt.Sprintf("%s/%s/temp", previewsPath, channelName)
-	previewID := time.Now().Unix()
-	previewPath := fmt.Sprintf("%s/%s/%v.jpg", previewsPath, channelName, previewID)
-	tempVideoPath := fmt.Sprintf("%s/temp.ts", tempDir)
+    cmd := exec.Command("ffmpeg",
+        "-hide_banner",
+        "-i", url, // Pass the .m3u8 URL here
+        "-vframes", "1",   // Get 1 frame
+        "-f", "image2",    // Output as an image
+        "-q:v", "5",       // Set JPEG quality (2-5 is good)
+        "pipe:1",
+    )
 
-	// Ensure directories exist
-	os.MkdirAll(tempDir, os.ModePerm)
+    cmd.Stdout = &out
+    cmd.Stderr = &stderr
 
-	// Download the segment
-	res, err := httpClient.Get(lastSegment)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
+    if err := cmd.Run(); err != nil {
+        lines := strings.Split(stderr.String(), "\n")
+        var filtered []string
+        for _, line := range lines {
+            line = strings.TrimSpace(line)
+            if strings.HasPrefix(line, "Error") || strings.Contains(line, "does not contain any stream") {
+                filtered = append(filtered, line)
+            }
+        }
+        filteredMsg := strings.Join(filtered, "\n")
+        return nil, fmt.Errorf("ffmpeg failed: %v\n%s", err, filteredMsg)
+    }
 
-	// Save segment to temporary file
-	tempFile, err := os.Create(tempVideoPath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		tempFile.Close()
-		os.Remove(tempVideoPath) // Clean up temp file
-	}()
-
-	_, err = io.Copy(tempFile, res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Extract last frame using ffmpeg
-	cmd := exec.Command("ffmpeg",
-		"-hide_banner",
-		"-i", tempVideoPath,
-		"-vframes", "1",
-		"-f", "image2",
-		"-update", "1",
-		previewPath)
-
-	err = cmd.Run()
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := os.ReadFile(previewPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read preview file: %w", err)
-	}
-
-	if err := os.Remove(previewPath); err != nil {
-		return data, fmt.Errorf("preview generated but failed to remove file: %w", err)
-	}
-	return data, nil
+    return out.Bytes(), nil
 }
